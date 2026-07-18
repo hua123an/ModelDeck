@@ -106,6 +106,7 @@ struct LaunchPreview {
     profile_id: String,
     tool: String,
     executable: String,
+    terminal: String,
     isolated_home: Option<String>,
     environment: Vec<String>,
     untouched_paths: Vec<String>,
@@ -1453,6 +1454,46 @@ fn resolve_executable(profile: &ToolProfile) -> Result<String, String> {
         .ok_or_else(|| format!("未找到 {name}。请先安装，或在档案中填写可执行文件完整路径"))
 }
 
+fn preferred_terminal() -> (&'static str, Option<&'static str>) {
+    if Path::new("/Applications/Ghostty.app").is_dir() {
+        ("Ghostty", Some("/Applications/Ghostty.app"))
+    } else if Path::new("/System/Applications/Utilities/Terminal.app").is_dir()
+        || Path::new("/Applications/Utilities/Terminal.app").is_dir()
+    {
+        ("Terminal", None)
+    } else {
+        ("Terminal", None)
+    }
+}
+
+fn ghostty_open_args<'a>(app_path: &'a str, shell: &'a str) -> [&'a str; 8] {
+    [
+        "-na", app_path, "--args", "-e", "/bin/zsh", "-lc", shell, "",
+    ]
+}
+
+fn launch_in_terminal(shell: &str) -> Result<(), String> {
+    let (terminal, app_path) = preferred_terminal();
+    if terminal == "Ghostty" {
+        let args = ghostty_open_args(app_path.unwrap_or("/Applications/Ghostty.app"), shell);
+        Command::new("/usr/bin/open")
+            .args(&args[..7])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    } else {
+        let script = format!(
+            "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
+            apple_script_quote(shell)
+        );
+        Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn profile_preview(
     app: &AppHandle,
     data: &PersistedData,
@@ -1467,6 +1508,7 @@ fn profile_preview(
         return Err("服务商没有模型 API Key".into());
     }
     let executable = resolve_executable(profile)?;
+    let terminal = preferred_terminal().0.to_string();
     let untouched = vec![
         "~/.codex".into(),
         "~/.claude".into(),
@@ -1478,6 +1520,7 @@ fn profile_preview(
             profile_id: profile.id.clone(),
             tool: profile.tool.clone(),
             executable: executable.clone(),
+            terminal: terminal.clone(),
             isolated_home: Some(home.display().to_string()),
             environment: vec![
                 "CODEX_HOME=<ModelDeck 独立目录>".into(),
@@ -1492,6 +1535,7 @@ fn profile_preview(
             profile_id: profile.id.clone(),
             tool: profile.tool.clone(),
             executable: executable.clone(),
+            terminal,
             isolated_home: None,
             environment: vec![
                 "ANTHROPIC_AUTH_TOKEN=<系统钥匙串>".into(),
@@ -1615,15 +1659,7 @@ fn launch_tool_profile(
                 .unwrap_or_default()
         );
     }
-    let script = format!(
-        "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
-        apple_script_quote(&shell)
-    );
-    Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    launch_in_terminal(&shell)?;
     for item in &mut data.profiles {
         item.active = item.id == profile_id;
     }
@@ -1687,6 +1723,24 @@ mod tests {
     fn quotes_shell_and_apple_script_values() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(apple_script_quote("a\\b\"c"), "\"a\\\\b\\\"c\"");
+    }
+
+    #[test]
+    fn prefers_ghostty_and_builds_direct_open_arguments() {
+        assert_eq!(preferred_terminal().0, "Ghostty");
+        let args = ghostty_open_args("/Applications/Ghostty.app", "printf 'ok'");
+        assert_eq!(
+            &args[..7],
+            &[
+                "-na",
+                "/Applications/Ghostty.app",
+                "--args",
+                "-e",
+                "/bin/zsh",
+                "-lc",
+                "printf 'ok'"
+            ]
+        );
     }
 
     #[test]

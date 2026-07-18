@@ -84,6 +84,7 @@ export interface LaunchPreview {
   profileId: string;
   tool: string;
   executable: string;
+  terminal: string;
   isolatedHome?: string;
   environment: string[];
   untouchedPaths: string[];
