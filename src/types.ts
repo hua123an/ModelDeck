@@ -59,10 +59,42 @@ export interface BalanceInfo {
   checkedAt: string;
 }
 
+export interface ToolProfile {
+  id: string;
+  name: string;
+  tool: "codex" | "claude";
+  providerId: string;
+  model?: string;
+  executable?: string;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ToolProfileInput {
+  id?: string;
+  name: string;
+  tool: "codex" | "claude";
+  providerId: string;
+  model?: string;
+  executable?: string;
+}
+
+export interface LaunchPreview {
+  profileId: string;
+  tool: string;
+  executable: string;
+  isolatedHome?: string;
+  environment: string[];
+  untouchedPaths: string[];
+  commandPreview: string;
+}
+
 export interface Snapshot {
   providers: Provider[];
   models: ModelStatus[];
   balances: BalanceInfo[];
+  profiles: ToolProfile[];
 }
 
 export interface AccountSummary {

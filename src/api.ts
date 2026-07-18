@@ -16,6 +16,7 @@ const initial: Snapshot = {
     { providerId: "preview-2", providerName: "Team New API", modelId: "claude-3-5-haiku", name: "Claude 3.5 Haiku", available: false, api: "unknown", latencyMs: 1134, lastCheckedAt: now(), statusCode: 404, error: "模型端点未启用" },
   ],
   balances: [{ providerId: "preview-2", supported: true, quota: 38.42, used: 61.58, multiplier: 1, accountName: "demo-user", group: "default", checkedAt: now() }],
+  profiles: [],
 };
 
 function read(): Snapshot {

@@ -3,12 +3,13 @@ import * as api from "./api";
 import { AlertIcon, BoxesIcon, CheckIcon, DownloadIcon, EyeIcon, LockIcon, MoreIcon, PencilIcon, PlayIcon, PlusIcon, RefreshIcon, SearchIcon, ServerIcon, SettingsIcon, TrashIcon, WalletIcon, XIcon } from "./icons";
 import type { BalanceInfo, ModelStatus, Provider, ProviderInput, ProviderType, Snapshot, StorageInfo } from "./types";
 import { AccountsPage, KeysPage, UsagePage } from "./ManagementPages";
+import { ProfilesPage } from "./ProfilesPage";
 import "./App.css";
 
-type Page = "providers" | "accounts" | "keys" | "usage" | "models" | "settings";
+type Page = "providers" | "profiles" | "accounts" | "keys" | "usage" | "models" | "settings";
 const typeLabels: Record<ProviderType, string> = { "new-api": "New API", sub2api: "Sub2API", "openai-compatible": "OpenAI Compatible" };
 const apiLabels = { responses: "Responses", "chat-completions": "Chat Completions", unknown: "未识别" } as const;
-const emptySnapshot: Snapshot = { providers: [], models: [], balances: [] };
+const emptySnapshot: Snapshot = { providers: [], models: [], balances: [], profiles: [] };
 
 function formatTime(value?: string) {
   if (!value) return "尚未检测";
@@ -79,9 +80,9 @@ function App() {
   const [page, setPage] = useState<Page>("providers"); const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot); const [info, setInfo] = useState<StorageInfo | null>(null); const [loading, setLoading] = useState(true); const [fatal, setFatal] = useState("");
   async function reload() { try { setSnapshot(await api.getSnapshot()); setFatal(""); } catch (e) { setFatal(messageOf(e)); } finally { setLoading(false); } }
   useEffect(() => { void reload(); void api.storageInfo().then(setInfo).catch(() => null); }, []);
-  const nav = [{ id: "providers" as const, label: "服务商", icon: <ServerIcon /> }, { id: "accounts" as const, label: "账户", icon: <WalletIcon /> }, { id: "keys" as const, label: "API Keys", icon: <LockIcon /> }, { id: "usage" as const, label: "统计", icon: <RefreshIcon /> }, { id: "models" as const, label: "模型", icon: <BoxesIcon />, count: snapshot.models.length }, { id: "settings" as const, label: "设置", icon: <SettingsIcon /> }];
+  const nav = [{ id: "providers" as const, label: "服务商", icon: <ServerIcon /> }, { id: "profiles" as const, label: "档案", icon: <PlayIcon /> }, { id: "accounts" as const, label: "账户", icon: <WalletIcon /> }, { id: "keys" as const, label: "API Keys", icon: <LockIcon /> }, { id: "usage" as const, label: "统计", icon: <RefreshIcon /> }, { id: "models" as const, label: "模型", icon: <BoxesIcon />, count: snapshot.models.length }, { id: "settings" as const, label: "设置", icon: <SettingsIcon /> }];
   return <div className="app-shell"><aside className="sidebar"><div className="brand"><div className="brand-mark"><BoxesIcon /></div><div><strong>ModelDeck</strong><span>LLM Control Center</span></div></div><nav>{nav.map((item) => <button key={item.id} className={page === item.id ? "active" : ""} onClick={() => setPage(item.id)}>{item.icon}<span>{item.label}</span>{item.count != null && <i>{item.count}</i>}</button>)}</nav><div className="sidebar-footer"><span className="pulse" />本地运行<div>密钥由系统钥匙串保护</div></div></aside>
-    <main className="content">{loading ? <div className="loading"><span className="spinner" />正在读取本地数据…</div> : fatal ? <div className="fatal"><AlertIcon /><h2>无法读取本地数据</h2><p>{fatal}</p><button className="button primary" onClick={() => void reload()}>重试</button></div> : page === "providers" ? <ProvidersPage snapshot={snapshot} reload={reload} /> : page === "accounts" ? <AccountsPage providers={snapshot.providers} /> : page === "keys" ? <KeysPage providers={snapshot.providers} /> : page === "usage" ? <UsagePage providers={snapshot.providers} /> : page === "models" ? <ModelsPage snapshot={snapshot} reload={reload} /> : <SettingsPage info={info} />}</main>
+    <main className="content">{loading ? <div className="loading"><span className="spinner" />正在读取本地数据…</div> : fatal ? <div className="fatal"><AlertIcon /><h2>无法读取本地数据</h2><p>{fatal}</p><button className="button primary" onClick={() => void reload()}>重试</button></div> : page === "providers" ? <ProvidersPage snapshot={snapshot} reload={reload} /> : page === "profiles" ? <ProfilesPage providers={snapshot.providers} profiles={snapshot.profiles} reload={reload} /> : page === "accounts" ? <AccountsPage providers={snapshot.providers} /> : page === "keys" ? <KeysPage providers={snapshot.providers} /> : page === "usage" ? <UsagePage providers={snapshot.providers} /> : page === "models" ? <ModelsPage snapshot={snapshot} reload={reload} /> : <SettingsPage info={info} />}</main>
   </div>;
 }
 export default App;

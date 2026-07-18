@@ -2,7 +2,13 @@ use chrono::Utc;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, sync::Mutex, time::Instant};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Mutex,
+    time::Instant,
+};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
@@ -71,6 +77,43 @@ struct ModelStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ToolProfile {
+    id: String,
+    name: String,
+    tool: String,
+    provider_id: String,
+    model: Option<String>,
+    executable: Option<String>,
+    active: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolProfileInput {
+    id: Option<String>,
+    name: String,
+    tool: String,
+    provider_id: String,
+    model: Option<String>,
+    executable: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchPreview {
+    profile_id: String,
+    tool: String,
+    executable: String,
+    isolated_home: Option<String>,
+    environment: Vec<String>,
+    untouched_paths: Vec<String>,
+    command_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct BalanceInfo {
     provider_id: String,
     supported: bool,
@@ -94,6 +137,8 @@ struct PersistedData {
     providers: Vec<Provider>,
     models: Vec<ModelStatus>,
     balances: Vec<BalanceInfo>,
+    #[serde(default)]
+    profiles: Vec<ToolProfile>,
 }
 
 struct AppState(Mutex<PersistedData>);
@@ -192,6 +237,7 @@ fn get_snapshot(state: State<'_, AppState>) -> Result<PersistedData, String> {
         providers: data.providers.clone(),
         models: data.models.clone(),
         balances: data.balances.clone(),
+        profiles: data.profiles.clone(),
     })
 }
 
@@ -1348,6 +1394,220 @@ async fn load_usage(
     })
 }
 
+fn profiles_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("profiles");
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    Ok(root)
+}
+
+fn resolve_executable(profile: &ToolProfile) -> Result<String, String> {
+    if let Some(path) = profile
+        .executable
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if Path::new(path).exists() {
+            return Ok(path.to_string());
+        }
+        return Err(format!("找不到可执行文件：{path}"));
+    }
+    let command = if profile.tool == "codex" {
+        "codex"
+    } else {
+        "claude"
+    };
+    let output = Command::new("/usr/bin/which")
+        .arg(command)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    Err(format!(
+        "本机 PATH 中没有 {command}，请在档案中选择可执行文件"
+    ))
+}
+
+fn profile_preview(
+    app: &AppHandle,
+    data: &PersistedData,
+    profile: &ToolProfile,
+) -> Result<LaunchPreview, String> {
+    let provider = data
+        .providers
+        .iter()
+        .find(|p| p.id == profile.provider_id)
+        .ok_or("档案引用的服务商不存在")?;
+    if !provider.has_api_key {
+        return Err("服务商没有模型 API Key".into());
+    }
+    let executable = resolve_executable(profile)?;
+    let untouched = vec![
+        "~/.codex".into(),
+        "~/.claude".into(),
+        "~/.zshrc / ~/.bashrc".into(),
+    ];
+    if profile.tool == "codex" {
+        let home = profiles_root(app)?.join("codex").join(&profile.id);
+        Ok(LaunchPreview {
+            profile_id: profile.id.clone(),
+            tool: profile.tool.clone(),
+            executable: executable.clone(),
+            isolated_home: Some(home.display().to_string()),
+            environment: vec![
+                "CODEX_HOME=<ModelDeck 独立目录>".into(),
+                "OPENAI_API_KEY=<系统钥匙串>".into(),
+                format!("OPENAI_BASE_URL={}/v1", provider.base_url),
+            ],
+            untouched_paths: untouched,
+            command_preview: format!("CODEX_HOME=… OPENAI_API_KEY=•••• {executable}"),
+        })
+    } else {
+        Ok(LaunchPreview {
+            profile_id: profile.id.clone(),
+            tool: profile.tool.clone(),
+            executable: executable.clone(),
+            isolated_home: None,
+            environment: vec![
+                "ANTHROPIC_AUTH_TOKEN=<系统钥匙串>".into(),
+                format!("ANTHROPIC_BASE_URL={}", provider.base_url),
+            ],
+            untouched_paths: untouched,
+            command_preview: format!("ANTHROPIC_AUTH_TOKEN=•••• {executable}"),
+        })
+    }
+}
+
+#[tauri::command]
+fn save_tool_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: ToolProfileInput,
+) -> Result<ToolProfile, String> {
+    if input.name.trim().is_empty() || !matches!(input.tool.as_str(), "codex" | "claude") {
+        return Err("档案名称或工具类型无效".into());
+    }
+    let mut data = state.0.lock().map_err(|e| e.to_string())?;
+    if !data.providers.iter().any(|p| p.id == input.provider_id) {
+        return Err("服务商不存在".into());
+    }
+    let now = Utc::now().to_rfc3339();
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let existing = data.profiles.iter().find(|p| p.id == id).cloned();
+    let profile = ToolProfile {
+        id: id.clone(),
+        name: input.name.trim().into(),
+        tool: input.tool,
+        provider_id: input.provider_id,
+        model: input.model.filter(|v| !v.trim().is_empty()),
+        executable: input.executable.filter(|v| !v.trim().is_empty()),
+        active: existing.as_ref().is_some_and(|p| p.active),
+        created_at: existing
+            .as_ref()
+            .map(|p| p.created_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        updated_at: now,
+    };
+    if let Some(position) = data.profiles.iter().position(|p| p.id == id) {
+        data.profiles[position] = profile.clone();
+    } else {
+        data.profiles.push(profile.clone());
+    }
+    save_data(&app, &data)?;
+    Ok(profile)
+}
+
+#[tauri::command]
+fn delete_tool_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<(), String> {
+    let mut data = state.0.lock().map_err(|e| e.to_string())?;
+    data.profiles.retain(|p| p.id != profile_id);
+    save_data(&app, &data)
+}
+
+#[tauri::command]
+fn preview_tool_launch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<LaunchPreview, String> {
+    let data = state.0.lock().map_err(|e| e.to_string())?;
+    let profile = data
+        .profiles
+        .iter()
+        .find(|p| p.id == profile_id)
+        .ok_or("档案不存在")?;
+    profile_preview(&app, &data, profile)
+}
+
+#[tauri::command]
+fn launch_tool_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<(), String> {
+    let mut data = state.0.lock().map_err(|e| e.to_string())?;
+    let profile = data
+        .profiles
+        .iter()
+        .find(|p| p.id == profile_id)
+        .cloned()
+        .ok_or("档案不存在")?;
+    let provider = data
+        .providers
+        .iter()
+        .find(|p| p.id == profile.provider_id)
+        .cloned()
+        .ok_or("服务商不存在")?;
+    let preview = profile_preview(&app, &data, &profile)?;
+    let key = get_model_key(&provider.id)?;
+    let shell;
+    if profile.tool == "codex" {
+        let home = PathBuf::from(preview.isolated_home.clone().ok_or("缺少隔离目录")?);
+        fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+        shell = format!("export CODEX_HOME={}; export OPENAI_API_KEY={}; export OPENAI_BASE_URL={}/v1; exec {}{}", shell_quote(&home.display().to_string()), shell_quote(&key), shell_quote(&provider.base_url), shell_quote(&preview.executable), profile.model.as_ref().map(|m| format!(" --model {}", shell_quote(m))).unwrap_or_default());
+    } else {
+        shell = format!(
+            "export ANTHROPIC_AUTH_TOKEN={}; export ANTHROPIC_BASE_URL={}; exec {}{}",
+            shell_quote(&key),
+            shell_quote(&provider.base_url),
+            shell_quote(&preview.executable),
+            profile
+                .model
+                .as_ref()
+                .map(|m| format!(" --model {}", shell_quote(m)))
+                .unwrap_or_default()
+        );
+    }
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
+        apple_script_quote(&shell)
+    );
+    Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    for item in &mut data.profiles {
+        item.active = item.id == profile_id;
+    }
+    save_data(&app, &data)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+fn apple_script_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,6 +1655,19 @@ mod tests {
     }
 
     #[test]
+    fn quotes_shell_and_apple_script_values() {
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(apple_script_quote("a\\b\"c"), "\"a\\\\b\\\"c\"");
+    }
+
+    #[test]
+    fn loads_legacy_data_without_profiles() {
+        let data: PersistedData =
+            serde_json::from_value(json!({"providers": [], "models": [], "balances": []})).unwrap();
+        assert!(data.profiles.is_empty());
+    }
+
+    #[test]
     fn normalizes_base_url_with_v1_suffix() {
         assert_eq!(
             normalize_url("https://example.com/v1/"),
@@ -1429,7 +1702,11 @@ pub fn run() {
             save_managed_key,
             toggle_managed_key,
             delete_managed_key,
-            load_usage
+            load_usage,
+            save_tool_profile,
+            delete_tool_profile,
+            preview_tool_launch,
+            launch_tool_profile
         ])
         .run(tauri::generate_context!())
         .expect("error while running ModelDeck");
