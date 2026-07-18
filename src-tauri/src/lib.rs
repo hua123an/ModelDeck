@@ -1410,26 +1410,47 @@ fn resolve_executable(profile: &ToolProfile) -> Result<String, String> {
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        if Path::new(path).exists() {
+        if Path::new(path).is_file() {
             return Ok(path.to_string());
         }
         return Err(format!("找不到可执行文件：{path}"));
     }
-    let command = if profile.tool == "codex" {
+    let name = if profile.tool == "codex" {
         "codex"
     } else {
         "claude"
     };
-    let output = Command::new("/usr/bin/which")
-        .arg(command)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    if let Ok(output) = Command::new("/usr/bin/which").arg(name).output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(path);
+            }
+        }
     }
-    Err(format!(
-        "本机 PATH 中没有 {command}，请在档案中选择可执行文件"
-    ))
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("无法确定用户主目录")?;
+    let mut candidates = vec![
+        home.join(".local/bin").join(name),
+        PathBuf::from("/opt/homebrew/bin").join(name),
+        PathBuf::from("/usr/local/bin").join(name),
+    ];
+    if let Ok(entries) = fs::read_dir(home.join(".nvm/versions/node")) {
+        let mut versions: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("bin").join(name))
+            .filter(|path| path.is_file())
+            .collect();
+        versions.sort();
+        versions.reverse();
+        candidates.splice(0..0, versions);
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(|path| path.display().to_string())
+        .ok_or_else(|| format!("未找到 {name}。请先安装，或在档案中填写可执行文件完整路径"))
 }
 
 fn profile_preview(
@@ -1482,16 +1503,13 @@ fn profile_preview(
     }
 }
 
-#[tauri::command]
-fn save_tool_profile(
-    app: AppHandle,
-    state: State<'_, AppState>,
+fn upsert_tool_profile(
+    data: &mut PersistedData,
     input: ToolProfileInput,
 ) -> Result<ToolProfile, String> {
     if input.name.trim().is_empty() || !matches!(input.tool.as_str(), "codex" | "claude") {
         return Err("档案名称或工具类型无效".into());
     }
-    let mut data = state.0.lock().map_err(|e| e.to_string())?;
     if !data.providers.iter().any(|p| p.id == input.provider_id) {
         return Err("服务商不存在".into());
     }
@@ -1517,6 +1535,17 @@ fn save_tool_profile(
     } else {
         data.profiles.push(profile.clone());
     }
+    Ok(profile)
+}
+
+#[tauri::command]
+fn save_tool_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: ToolProfileInput,
+) -> Result<ToolProfile, String> {
+    let mut data = state.0.lock().map_err(|e| e.to_string())?;
+    let profile = upsert_tool_profile(&mut data, input)?;
     save_data(&app, &data)?;
     Ok(profile)
 }
@@ -1658,6 +1687,49 @@ mod tests {
     fn quotes_shell_and_apple_script_values() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(apple_script_quote("a\\b\"c"), "\"a\\\\b\\\"c\"");
+    }
+
+    #[test]
+    fn finds_installed_tools_outside_minimal_app_path() {
+        let profile = ToolProfile {
+            id: "x".into(),
+            name: "Codex".into(),
+            tool: "codex".into(),
+            provider_id: "p".into(),
+            model: None,
+            executable: None,
+            active: false,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        let path = resolve_executable(&profile).unwrap();
+        assert!(path.ends_with("/codex"));
+        assert!(Path::new(&path).is_file());
+    }
+
+    #[test]
+    fn saves_and_reloads_profile_from_legacy_data() {
+        let mut data: PersistedData = serde_json::from_value(json!({
+            "providers": [{"id":"p","name":"Demo","type":"new-api","baseUrl":"https://example.com","enabled":true,"createdAt":"now","updatedAt":"now","hasApiKey":true}],
+            "models": [], "balances": []
+        })).unwrap();
+        let profile = upsert_tool_profile(
+            &mut data,
+            ToolProfileInput {
+                id: None,
+                name: "Work".into(),
+                tool: "codex".into(),
+                provider_id: "p".into(),
+                model: Some("gpt-5".into()),
+                executable: None,
+            },
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&data).unwrap();
+        let loaded: PersistedData = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].id, profile.id);
+        assert_eq!(loaded.profiles[0].model.as_deref(), Some("gpt-5"));
     }
 
     #[test]
