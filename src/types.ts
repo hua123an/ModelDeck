@@ -83,12 +83,10 @@ export interface ToolProfileInput {
 export interface LaunchPreview {
   profileId: string;
   tool: string;
-  executable: string;
-  terminal: string;
-  isolatedHome?: string;
-  environment: string[];
+  targetFile: string;
+  backupDirectory: string;
+  changes: string[];
   untouchedPaths: string[];
-  commandPreview: string;
 }
 
 export interface Snapshot {

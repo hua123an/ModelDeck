@@ -5,11 +5,11 @@ use serde_json::{json, Value};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::Mutex,
     time::Instant,
 };
 use tauri::{AppHandle, Manager, State};
+use toml_edit::{value as toml_value, DocumentMut, Item, Table};
 use uuid::Uuid;
 
 const KEYRING_SERVICE: &str = "com.huaan.modeldeck";
@@ -105,12 +105,10 @@ struct ToolProfileInput {
 struct LaunchPreview {
     profile_id: String,
     tool: String,
-    executable: String,
-    terminal: String,
-    isolated_home: Option<String>,
-    environment: Vec<String>,
+    target_file: String,
+    backup_directory: String,
+    changes: Vec<String>,
     untouched_paths: Vec<String>,
-    command_preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1395,103 +1393,147 @@ async fn load_usage(
     })
 }
 
-fn profiles_root(app: &AppHandle) -> Result<PathBuf, String> {
-    let root = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("profiles");
-    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    Ok(root)
-}
-
-fn resolve_executable(profile: &ToolProfile) -> Result<String, String> {
-    if let Some(path) = profile
-        .executable
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        if Path::new(path).is_file() {
-            return Ok(path.to_string());
-        }
-        return Err(format!("找不到可执行文件：{path}"));
-    }
-    let name = if profile.tool == "codex" {
-        "codex"
-    } else {
-        "claude"
-    };
-    if let Ok(output) = Command::new("/usr/bin/which").arg(name).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(path);
-            }
-        }
-    }
+fn system_config_path(tool: &str) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("无法确定用户主目录")?;
-    let mut candidates = vec![
-        home.join(".local/bin").join(name),
-        PathBuf::from("/opt/homebrew/bin").join(name),
-        PathBuf::from("/usr/local/bin").join(name),
-    ];
-    if let Ok(entries) = fs::read_dir(home.join(".nvm/versions/node")) {
-        let mut versions: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("bin").join(name))
-            .filter(|path| path.is_file())
-            .collect();
-        versions.sort();
-        versions.reverse();
-        candidates.splice(0..0, versions);
-    }
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .map(|path| path.display().to_string())
-        .ok_or_else(|| format!("未找到 {name}。请先安装，或在档案中填写可执行文件完整路径"))
+    Ok(if tool == "codex" {
+        home.join(".codex/config.toml")
+    } else {
+        home.join(".claude/settings.json")
+    })
 }
 
-fn preferred_terminal() -> (&'static str, Option<&'static str>) {
-    if Path::new("/Applications/Ghostty.app").is_dir() {
-        ("Ghostty", Some("/Applications/Ghostty.app"))
-    } else if Path::new("/System/Applications/Utilities/Terminal.app").is_dir()
-        || Path::new("/Applications/Utilities/Terminal.app").is_dir()
+fn config_backup_dir(app: &AppHandle, tool: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("config-backups")
+        .join(tool);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+fn file_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
     {
-        ("Terminal", None)
-    } else {
-        ("Terminal", None)
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).ok().map(|m| m.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
-fn ghostty_open_args<'a>(app_path: &'a str, shell: &'a str) -> [&'a str; 8] {
-    [
-        "-na", app_path, "--args", "-e", "/bin/zsh", "-lc", shell, "",
-    ]
+fn write_atomic(path: &Path, content: &[u8], mode: Option<u32>) -> Result<(), String> {
+    let parent = path.parent().ok_or("配置路径没有父目录")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let temp = parent.join(format!(".modeldeck-{}.tmp", Uuid::new_v4()));
+    fs::write(&temp, content).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&temp, path).map_err(|e| e.to_string())
 }
 
-fn launch_in_terminal(shell: &str) -> Result<(), String> {
-    let (terminal, app_path) = preferred_terminal();
-    if terminal == "Ghostty" {
-        let args = ghostty_open_args(app_path.unwrap_or("/Applications/Ghostty.app"), shell);
-        Command::new("/usr/bin/open")
-            .args(&args[..7])
-            .spawn()
-            .map_err(|e| e.to_string())?;
+fn backup_config(app: &AppHandle, tool: &str, target: &Path) -> Result<PathBuf, String> {
+    let dir = config_backup_dir(app, tool)?;
+    let backup = dir.join(format!(
+        "{}-{}.bak",
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        target
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("config")
+    ));
+    if target.exists() {
+        fs::copy(target, &backup).map_err(|e| e.to_string())?;
+        if let Some(mode) = file_mode(target) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&backup, fs::Permissions::from_mode(mode))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     } else {
-        let script = format!(
-            "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
-            apple_script_quote(shell)
-        );
-        Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(script)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        fs::write(&backup, b"__MODELDECK_MISSING__").map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(backup)
+}
+
+fn merge_codex_config(
+    existing: &str,
+    provider: &Provider,
+    profile: &ToolProfile,
+    key: &str,
+) -> Result<String, String> {
+    let mut doc = if existing.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        existing
+            .parse::<DocumentMut>()
+            .map_err(|e| format!("Codex config.toml 解析失败：{e}"))?
+    };
+    if let Some(model) = &profile.model {
+        doc["model"] = toml_value(model);
+    }
+    doc["model_provider"] = toml_value("modeldeck");
+    if !doc.as_table().contains_key("model_providers") {
+        doc["model_providers"] = Item::Table(Table::new());
+    }
+    let providers = doc["model_providers"]
+        .as_table_mut()
+        .ok_or("Codex config.toml 的 model_providers 必须是表")?;
+    if !providers.contains_key("modeldeck") {
+        providers["modeldeck"] = Item::Table(Table::new());
+    }
+    let table = providers["modeldeck"]
+        .as_table_mut()
+        .ok_or("Codex modeldeck provider 必须是表")?;
+    table["name"] = toml_value(format!("ModelDeck · {}", provider.name));
+    table["base_url"] = toml_value(format!("{}/v1", provider.base_url));
+    table.remove("env_key");
+    table["experimental_bearer_token"] = toml_value(key);
+    table["wire_api"] = toml_value("responses");
+    doc.as_table_mut().remove("modeldeck_api_key");
+    Ok(doc.to_string())
+}
+
+fn merge_claude_settings(
+    existing: &str,
+    provider: &Provider,
+    profile: &ToolProfile,
+    key: &str,
+) -> Result<String, String> {
+    let mut root: Value = if existing.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(existing).map_err(|e| format!("Claude settings.json 解析失败：{e}"))?
+    };
+    let object = root
+        .as_object_mut()
+        .ok_or("Claude settings.json 顶层必须是对象")?;
+    let env = object
+        .entry("env")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("Claude settings.json 的 env 必须是对象")?;
+    env.insert("ANTHROPIC_BASE_URL".into(), json!(provider.base_url));
+    env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(key));
+    if let Some(model) = &profile.model {
+        env.insert("ANTHROPIC_MODEL".into(), json!(model));
+    } else {
+        env.remove("ANTHROPIC_MODEL");
+    }
+    serde_json::to_string_pretty(&root)
+        .map(|v| format!("{v}\n"))
+        .map_err(|e| e.to_string())
 }
 
 fn profile_preview(
@@ -1507,44 +1549,52 @@ fn profile_preview(
     if !provider.has_api_key {
         return Err("服务商没有模型 API Key".into());
     }
-    let executable = resolve_executable(profile)?;
-    let terminal = preferred_terminal().0.to_string();
-    let untouched = vec![
-        "~/.codex".into(),
-        "~/.claude".into(),
-        "~/.zshrc / ~/.bashrc".into(),
-    ];
-    if profile.tool == "codex" {
-        let home = profiles_root(app)?.join("codex").join(&profile.id);
-        Ok(LaunchPreview {
-            profile_id: profile.id.clone(),
-            tool: profile.tool.clone(),
-            executable: executable.clone(),
-            terminal: terminal.clone(),
-            isolated_home: Some(home.display().to_string()),
-            environment: vec![
-                "CODEX_HOME=<ModelDeck 独立目录>".into(),
-                "OPENAI_API_KEY=<系统钥匙串>".into(),
-                format!("OPENAI_BASE_URL={}/v1", provider.base_url),
-            ],
-            untouched_paths: untouched,
-            command_preview: format!("CODEX_HOME=… OPENAI_API_KEY=•••• {executable}"),
-        })
+    let target = system_config_path(&profile.tool)?;
+    let changes = if profile.tool == "codex" {
+        vec![
+            format!(
+                "model = {}",
+                profile.model.as_deref().unwrap_or("保持当前/工具默认")
+            ),
+            "model_provider = modeldeck".into(),
+            "model_providers.modeldeck.experimental_bearer_token = <系统钥匙串>".into(),
+            format!(
+                "model_providers.modeldeck.base_url = {}/v1",
+                provider.base_url
+            ),
+            "保留 auth.json 与其他 config.toml 字段".into(),
+        ]
     } else {
-        Ok(LaunchPreview {
-            profile_id: profile.id.clone(),
-            tool: profile.tool.clone(),
-            executable: executable.clone(),
-            terminal,
-            isolated_home: None,
-            environment: vec![
-                "ANTHROPIC_AUTH_TOKEN=<系统钥匙串>".into(),
-                format!("ANTHROPIC_BASE_URL={}", provider.base_url),
-            ],
-            untouched_paths: untouched,
-            command_preview: format!("ANTHROPIC_AUTH_TOKEN=•••• {executable}"),
-        })
-    }
+        vec![
+            format!("env.ANTHROPIC_BASE_URL = {}", provider.base_url),
+            "env.ANTHROPIC_AUTH_TOKEN = <系统钥匙串>".into(),
+            format!(
+                "env.ANTHROPIC_MODEL = {}",
+                profile.model.as_deref().unwrap_or("工具默认")
+            ),
+            "保留 settings.json 其他字段".into(),
+        ]
+    };
+    Ok(LaunchPreview {
+        profile_id: profile.id.clone(),
+        tool: profile.tool.clone(),
+        target_file: target.display().to_string(),
+        backup_directory: config_backup_dir(app, &profile.tool)?.display().to_string(),
+        changes,
+        untouched_paths: if profile.tool == "codex" {
+            vec![
+                "~/.codex/auth.json".into(),
+                "~/.codex/history.jsonl".into(),
+                "项目目录与登录态".into(),
+            ]
+        } else {
+            vec![
+                "~/.claude.json".into(),
+                "~/.claude/history.jsonl".into(),
+                "项目目录与会话".into(),
+            ]
+        },
+    })
 }
 
 fn upsert_tool_profile(
@@ -1639,38 +1689,50 @@ fn launch_tool_profile(
         .find(|p| p.id == profile.provider_id)
         .cloned()
         .ok_or("服务商不存在")?;
-    let preview = profile_preview(&app, &data, &profile)?;
+    let target = system_config_path(&profile.tool)?;
+    let existing = fs::read_to_string(&target).unwrap_or_default();
     let key = get_model_key(&provider.id)?;
-    let shell;
-    if profile.tool == "codex" {
-        let home = PathBuf::from(preview.isolated_home.clone().ok_or("缺少隔离目录")?);
-        fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-        shell = format!("export CODEX_HOME={}; export OPENAI_API_KEY={}; export OPENAI_BASE_URL={}/v1; exec {}{}", shell_quote(&home.display().to_string()), shell_quote(&key), shell_quote(&provider.base_url), shell_quote(&preview.executable), profile.model.as_ref().map(|m| format!(" --model {}", shell_quote(m))).unwrap_or_default());
+    let merged = if profile.tool == "codex" {
+        merge_codex_config(&existing, &provider, &profile, &key)?
     } else {
-        shell = format!(
-            "export ANTHROPIC_AUTH_TOKEN={}; export ANTHROPIC_BASE_URL={}; exec {}{}",
-            shell_quote(&key),
-            shell_quote(&provider.base_url),
-            shell_quote(&preview.executable),
-            profile
-                .model
-                .as_ref()
-                .map(|m| format!(" --model {}", shell_quote(m)))
-                .unwrap_or_default()
-        );
-    }
-    launch_in_terminal(&shell)?;
+        merge_claude_settings(&existing, &provider, &profile, &key)?
+    };
+    backup_config(&app, &profile.tool, &target)?;
+    let mode = file_mode(&target).or(Some(0o600));
+    write_atomic(&target, merged.as_bytes(), mode)?;
     for item in &mut data.profiles {
-        item.active = item.id == profile_id;
+        if item.tool == profile.tool {
+            item.active = item.id == profile_id;
+        }
     }
     save_data(&app, &data)
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-fn apple_script_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+#[tauri::command]
+fn restore_tool_config(app: AppHandle, tool: String) -> Result<String, String> {
+    if !matches!(tool.as_str(), "codex" | "claude") {
+        return Err("未知工具".into());
+    }
+    let dir = config_backup_dir(&app, &tool)?;
+    let mut backups: Vec<PathBuf> = fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|v| v.to_str()) == Some("bak"))
+        .collect();
+    backups.sort();
+    let backup = backups.pop().ok_or("没有可恢复的备份")?;
+    let target = system_config_path(&tool)?;
+    let content = fs::read(&backup).map_err(|e| e.to_string())?;
+    if content == b"__MODELDECK_MISSING__" {
+        if target.exists() {
+            fs::remove_file(&target).map_err(|e| e.to_string())?;
+        }
+    } else {
+        write_atomic(&target, &content, file_mode(&backup).or(Some(0o600)))?;
+    }
+    fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    Ok(target.display().to_string())
 }
 
 #[cfg(test)]
@@ -1719,46 +1781,87 @@ mod tests {
         );
     }
 
-    #[test]
-    fn quotes_shell_and_apple_script_values() {
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
-        assert_eq!(apple_script_quote("a\\b\"c"), "\"a\\\\b\\\"c\"");
+    fn sample_provider() -> Provider {
+        Provider {
+            id: "p".into(),
+            name: "Demo".into(),
+            provider_type: ProviderType::NewApi,
+            base_url: "https://example.com".into(),
+            enabled: true,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            has_api_key: true,
+            has_account_token: false,
+            account_user_id: None,
+            has_refresh_token: false,
+            token_expires_at: None,
+        }
     }
 
-    #[test]
-    fn prefers_ghostty_and_builds_direct_open_arguments() {
-        assert_eq!(preferred_terminal().0, "Ghostty");
-        let args = ghostty_open_args("/Applications/Ghostty.app", "printf 'ok'");
-        assert_eq!(
-            &args[..7],
-            &[
-                "-na",
-                "/Applications/Ghostty.app",
-                "--args",
-                "-e",
-                "/bin/zsh",
-                "-lc",
-                "printf 'ok'"
-            ]
-        );
-    }
-
-    #[test]
-    fn finds_installed_tools_outside_minimal_app_path() {
-        let profile = ToolProfile {
+    fn sample_profile(tool: &str) -> ToolProfile {
+        ToolProfile {
             id: "x".into(),
-            name: "Codex".into(),
-            tool: "codex".into(),
+            name: "Work".into(),
+            tool: tool.into(),
             provider_id: "p".into(),
-            model: None,
+            model: Some("model-x".into()),
             executable: None,
             active: false,
             created_at: "now".into(),
             updated_at: "now".into(),
-        };
-        let path = resolve_executable(&profile).unwrap();
-        assert!(path.ends_with("/codex"));
-        assert!(Path::new(&path).is_file());
+        }
+    }
+
+    #[test]
+    fn merges_codex_fields_without_touching_projects() {
+        let existing =
+            "approvals_reviewer = \"user\"\n[projects.\"/tmp/demo\"]\ntrust_level = \"trusted\"\n";
+        let merged = merge_codex_config(
+            existing,
+            &sample_provider(),
+            &sample_profile("codex"),
+            "secret",
+        )
+        .unwrap();
+        let doc = merged.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["approvals_reviewer"].as_str(), Some("user"));
+        assert_eq!(
+            doc["projects"]["/tmp/demo"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(doc["model_provider"].as_str(), Some("modeldeck"));
+        assert_eq!(
+            doc["model_providers"]["modeldeck"]["base_url"].as_str(),
+            Some("https://example.com/v1")
+        );
+    }
+
+    #[test]
+    fn merges_claude_env_without_touching_theme() {
+        let merged = merge_claude_settings(
+            "{\"theme\":\"dark\",\"env\":{\"KEEP\":\"yes\"}}",
+            &sample_provider(),
+            &sample_profile("claude"),
+            "secret",
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(value["env"]["KEEP"], "yes");
+        assert_eq!(value["env"]["ANTHROPIC_AUTH_TOKEN"], "secret");
+    }
+
+    #[test]
+    fn atomic_write_preserves_restricted_permissions() {
+        let dir = std::env::temp_dir().join(format!("modeldeck-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        write_atomic(&path, b"before", Some(0o600)).unwrap();
+        write_atomic(&path, b"after", file_mode(&path)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after");
+        #[cfg(unix)]
+        assert_eq!(file_mode(&path).unwrap() & 0o777, 0o600);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1832,7 +1935,8 @@ pub fn run() {
             save_tool_profile,
             delete_tool_profile,
             preview_tool_launch,
-            launch_tool_profile
+            launch_tool_profile,
+            restore_tool_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running ModelDeck");
